@@ -121,22 +121,21 @@ class RagApp(ctk.CTk):
         self._refresh_doc_list()
 
         btn_frame = ctk.CTkFrame(side, fg_color="transparent")
-        btn_frame.grid(row=5, column=0, padx=12, pady=12, sticky="ew")
-        btn_frame.grid_columnconfigure((0, 1), weight=1)
+        btn_frame.grid(row=5, column=0, padx=16, pady=(8, 4), sticky="ew")
 
         ctk.CTkButton(btn_frame, text="Add files",
                       command=self.on_add_files,
                       fg_color=ACCENT, hover_color=ACCENT_H,
                       font=ctk.CTkFont(size=12),
-                      height=34, corner_radius=8).grid(
-            row=0, column=0, padx=(0, 4), sticky="ew")
+                      height=34, corner_radius=8).pack(
+            fill="x", pady=(0, 6))
 
         ctk.CTkButton(btn_frame, text="Add folder",
                       command=self.on_add_folder,
                       fg_color=BG_CARD, hover_color=BORDER,
                       font=ctk.CTkFont(size=12),
-                      height=34, corner_radius=8).grid(
-            row=0, column=1, padx=(4, 0), sticky="ew")
+                      height=34, corner_radius=8).pack(
+            fill="x")
 
         ctk.CTkButton(side, text="Clear index",
                       command=self.on_reset,
@@ -146,7 +145,7 @@ class RagApp(ctk.CTk):
                       hover_color="#2A1515",
                       font=ctk.CTkFont(size=12),
                       height=32, corner_radius=8).grid(
-            row=6, column=0, padx=12, pady=(0, 12), sticky="ew")
+            row=6, column=0, padx=16, pady=(4, 12), sticky="ew")
 
         # status pill
         self.status_dot = ctk.CTkLabel(side, text="●", text_color=WARNING,
