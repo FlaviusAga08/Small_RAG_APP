@@ -16,6 +16,7 @@ class LoginDialog(ctk.CTkToplevel):
         super().__init__(parent)
         self.store = store
         self.authenticated = False
+        self.user_info: dict | None = None
 
         self.title("Login")
         self.resizable(False, False)
@@ -87,6 +88,7 @@ class LoginDialog(ctk.CTkToplevel):
         username = self.user_entry.get().strip()
         password = self.pass_entry.get()
         if self.store.authenticate(username, password):
+            self.user_info = self.store.get_user(username)
             self.authenticated = True
             self.destroy()
         else:

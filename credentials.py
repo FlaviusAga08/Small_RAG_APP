@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from datetime import date, timedelta
 
 from theme import appdata_dir
 
@@ -34,7 +35,11 @@ class CredentialStore:
         h = hashlib.pbkdf2_hmac(
             "sha256", password.encode(), bytes.fromhex(salt), 200_000
         ).hex()
-        data[username.lower()] = {"hash": h, "salt": salt, "display": username}
+        trial_until = (date.today() + timedelta(days=30)).isoformat()
+        data[username.lower()] = {
+            "hash": h, "salt": salt, "display": username,
+            "status": "trial", "trial_until": trial_until,
+        }
         self._save(data)
         return True, ""
 
@@ -47,3 +52,47 @@ class CredentialStore:
             "sha256", password.encode(), bytes.fromhex(entry["salt"]), 200_000
         ).hex()
         return h == entry["hash"]
+
+    def get_user(self, username: str) -> dict | None:
+        """Return user info with computed effective subscription status."""
+        data = self._load()
+        entry = data.get(username.lower())
+        if not entry:
+            return None
+
+        stored_status = entry.get("status", "active")   # legacy accounts → active
+        trial_until_str = entry.get("trial_until")
+        days_remaining = None
+
+        if stored_status == "trial" and trial_until_str:
+            days_remaining = (date.fromisoformat(trial_until_str) - date.today()).days
+            effective_status = "trial" if days_remaining > 0 else "trial_expired"
+            days_remaining = max(days_remaining, 0)
+        elif stored_status == "active":
+            effective_status = "active"
+        else:
+            effective_status = "revoked"
+
+        return {
+            "username":      username.lower(),
+            "display":       entry.get("display", username),
+            "status":        effective_status,
+            "days_remaining": days_remaining,
+        }
+
+    def set_status(self, username: str, status: str,
+                   trial_days: int = 30) -> bool:
+        """Admin: change a user's subscription status. Returns False if not found."""
+        data = self._load()
+        key = username.lower()
+        if key not in data:
+            return False
+        data[key]["status"] = status
+        if status == "trial":
+            data[key]["trial_until"] = (
+                date.today() + timedelta(days=trial_days)
+            ).isoformat()
+        else:
+            data[key].pop("trial_until", None)
+        self._save(data)
+        return True

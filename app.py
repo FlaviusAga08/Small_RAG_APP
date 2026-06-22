@@ -25,7 +25,6 @@ CFG = {
     "api_key":       os.getenv("VAST_API_KEY", "not-required"),
     "llm_model":     rag.DEFAULTS["llm_model"],
     "embed_model":   rag.DEFAULTS["embed_model"],
-    "store":         str(appdata_dir() / "rag_store"),
     "top_k":         rag.DEFAULTS["top_k"],
     "num_ctx":       rag.DEFAULTS["num_ctx"],
     "temperature":   rag.DEFAULTS["temperature"],
@@ -45,24 +44,70 @@ class RagApp(ctk.CTk):
 
         self.events: queue.Queue = queue.Queue()
         self.busy   = False
+        self.subscription_blocked = False
+        self.user_store_path = ""
         self.client = OpenAI(base_url=CFG["base_url"], api_key=CFG["api_key"],
                              timeout=600)
-        self.store  = rag.VectorStore(CFG["store"], CFG["embed_model"]).load()
+        # Temporary empty store — replaced with the real per-user store after login
+        self.store = rag.VectorStore(str(appdata_dir() / "_tmp"), CFG["embed_model"])
         self._doc_vars: list[tuple[str, ctk.StringVar]] = []
 
         self._build()
         self.after(50, self._drain)
         self.after(100, self._show_login)
 
+    # ─────────────────────── login & subscription ───────────────────
+
     def _show_login(self):
-        store  = CredentialStore()
-        dialog = LoginDialog(self, store)
+        cred_store = CredentialStore()
+        dialog     = LoginDialog(self, cred_store)
         self.wait_window(dialog)
         if not dialog.authenticated:
             self.destroy()
             return
+
+        user_info = dialog.user_info
+        username  = user_info["username"]
+
+        # Per-user isolated document store
+        self.user_store_path = str(appdata_dir() / "stores" / username)
+        self.store = rag.VectorStore(self.user_store_path, CFG["embed_model"]).load()
+        self._refresh_doc_list()
+
         self.deiconify()
-        self._start(self._startup)
+        self._apply_subscription_state(user_info)
+
+        if not self.subscription_blocked:
+            self._start(self._startup)
+        else:
+            self.events.put(("dot", DANGER))
+            self.events.put(("status", "Subscription required"))
+
+    def _apply_subscription_state(self, user_info: dict):
+        status = user_info["status"]
+
+        if status == "active":
+            self.sub_banner.grid_remove()
+            self.subscription_blocked = False
+
+        elif status == "trial":
+            days = user_info["days_remaining"]
+            label = f"Trial — {days} day{'s' if days != 1 else ''} remaining"
+            self.sub_banner.configure(fg_color=WARNING)
+            self.sub_banner_lbl.configure(text=label, text_color=BG_MAIN)
+            self.sub_banner.grid()
+            self.subscription_blocked = False
+
+        else:   # "revoked" or "trial_expired"
+            if status == "trial_expired":
+                msg = "Trial expired — subscription required."
+            else:
+                msg = "Subscription Revoked."
+            self.sub_banner.configure(fg_color=DANGER)
+            self.sub_banner_lbl.configure(text=msg, text_color=TEXT_PRI)
+            self.sub_banner.grid()
+            self.subscription_blocked = True
+            self._set_inputs(False)
 
     # ─────────────────────────── layout ────────────────────────────
 
@@ -115,8 +160,7 @@ class RagApp(ctk.CTk):
                       command=self.on_reset,
                       fg_color="transparent",
                       border_width=1, border_color=DANGER,
-                      text_color=DANGER,
-                      hover_color="#2A1515",
+                      text_color=DANGER, hover_color="#2A1515",
                       font=ctk.CTkFont(size=12),
                       height=32, corner_radius=8).grid(
             row=6, column=0, padx=16, pady=(4, 12), sticky="ew")
@@ -133,18 +177,33 @@ class RagApp(ctk.CTk):
         # ── main area ────────────────────────────────────────────
         main = ctk.CTkFrame(self, fg_color=BG_MAIN, corner_radius=0)
         main.grid(row=0, column=1, sticky="nsew")
-        main.grid_rowconfigure(0, weight=1)
+        main.grid_rowconfigure(0, weight=0)   # banner  — fixed height
+        main.grid_rowconfigure(1, weight=1)   # chat    — expands
+        main.grid_rowconfigure(2, weight=0)   # input   — fixed height
         main.grid_columnconfigure(0, weight=1)
 
+        # subscription banner (row=0, hidden by default)
+        self.sub_banner = ctk.CTkFrame(main, fg_color=WARNING,
+                                       corner_radius=0, height=38)
+        self.sub_banner.grid(row=0, column=0, sticky="ew")
+        self.sub_banner.grid_columnconfigure(0, weight=1)
+        self.sub_banner.grid_remove()         # hidden until needed
+        self.sub_banner_lbl = ctk.CTkLabel(
+            self.sub_banner, text="",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=BG_MAIN)
+        self.sub_banner_lbl.grid(row=0, column=0, pady=8)
+
+        # chat area (row=1)
         self.chat = ctk.CTkScrollableFrame(main, fg_color="transparent")
-        self.chat.grid(row=0, column=0, sticky="nsew", padx=24, pady=(20, 0))
+        self.chat.grid(row=1, column=0, sticky="nsew", padx=24, pady=(20, 0))
         self.chat.grid_columnconfigure(0, weight=1)
         self._chat_row = 0
-
         self._show_welcome()
 
+        # input row (row=2)
         inp = ctk.CTkFrame(main, fg_color=BG_INPUT, corner_radius=16, height=56)
-        inp.grid(row=1, column=0, sticky="ew", padx=24, pady=16)
+        inp.grid(row=2, column=0, sticky="ew", padx=24, pady=16)
         inp.grid_columnconfigure(0, weight=1)
         inp.grid_propagate(False)
 
@@ -177,8 +236,7 @@ class RagApp(ctk.CTk):
             row=0, column=0, padx=20, pady=(16, 4), sticky="w")
         ctk.CTkLabel(card,
                      text="Add documents on the left, then ask questions here.",
-                     font=ctk.CTkFont(size=13),
-                     text_color=TEXT_SEC,
+                     font=ctk.CTkFont(size=13), text_color=TEXT_SEC,
                      justify="left").grid(
             row=1, column=0, padx=20, pady=(0, 16), sticky="w")
 
@@ -288,6 +346,8 @@ class RagApp(ctk.CTk):
     # ─────────────────────── worker glue ────────────────────────
 
     def _set_inputs(self, on: bool):
+        if on and self.subscription_blocked:
+            return          # stay disabled if subscription is not active
         state = "normal" if on else "disabled"
         self.btn_ask.configure(state=state)
         self.entry.configure(state=state)
@@ -399,8 +459,9 @@ class RagApp(ctk.CTk):
         self.events.put(("bot_end", srcs))
 
     def _reset(self):
-        (Path(CFG["store"]) / "meta.pkl").unlink(missing_ok=True)
-        self.store = rag.VectorStore(CFG["store"], CFG["embed_model"]).load()
+        (Path(self.user_store_path) / "meta.pkl").unlink(missing_ok=True)
+        self.store = rag.VectorStore(
+            self.user_store_path, CFG["embed_model"]).load()
         self.events.put(("status", "Index cleared"))
         self.events.put(("docs_changed",))
 
