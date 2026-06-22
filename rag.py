@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-"""
-Offline RAG for Ryzen 7 + Radeon 780M (gfx1103).
-
-Inference and embeddings run through a local Ollama server, which offloads
-Gemma 3 4B onto the 780M iGPU via Vulkan (most reliable) or ROCm. Everything
-else -- file reading, chunking, the vector index, retrieval -- is pure Python.
-
-Commands:
-    python rag.py ingest <file|dir> [<file|dir> ...]
-    python rag.py query "your question"
-    python rag.py chat
-    python rag.py stats
-    python rag.py reset
-
-No data leaves the machine.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -24,7 +6,7 @@ import os
 import pickle
 import sys
 from pathlib import Path
-
+import fitz
 import numpy as np
 
 try:
@@ -33,29 +15,31 @@ except ImportError:
     sys.exit("Missing dependency. Install with:  pip install faiss-cpu")
 
 try:
-    import ollama
-    from ollama import Client
+    from openai import OpenAI
 except ImportError:
-    sys.exit("Missing dependency. Install with:  pip install ollama")
+    sys.exit("Missing dependency. Install with:  pip install openai")
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    sys.exit("Missing dependency. Install with:  pip install python-dotenv")
+
+load_dotenv()
 
 # --------------------------------------------------------------------------
-# configuration defaults (override on the command line)
+# configuration defaults (override via .env or command line)
 # --------------------------------------------------------------------------
 
 DEFAULTS = {
-    "llm_model": "gemma3:4b",
-    "embed_model": "nomic-embed-text",
-    "store": "rag_store",
-    "host": "http://localhost:11434",
-    "top_k": 5,
-    "chunk_size": 1000,     # characters per chunk
-    "chunk_overlap": 150,   # characters carried between adjacent chunks
-    "num_ctx": 4096,        # context window; smaller = less KV-cache RAM
-    "temperature": 0.2,     # low = grounded, factual answers
-    "keep_alive": "5m",     # how long Ollama holds the model after a call.
-                            # "0" unloads immediately (frees RAM the moment a
-                            # query finishes); "5m" keeps it warm for a session.
+    "llm_model":     os.getenv("VAST_LLM_MODEL", "llama3"),
+    "embed_model":   os.getenv("VAST_EMBED_MODEL", "nomic-embed-text"),
+    "store":         "rag_store",
+    "base_url":      os.getenv("VAST_BASE_URL", "http://localhost:8000/v1"),
+    "top_k":         10,
+    "chunk_size":    2000,     # characters per chunk
+    "chunk_overlap": 400,      # characters carried between adjacent chunks
+    "num_ctx":       4096,     # max tokens in the LLM response
+    "temperature":   0.2,      # low = grounded, factual answers
 }
 
 SUPPORTED_TEXT = {
@@ -64,7 +48,7 @@ SUPPORTED_TEXT = {
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
     ".csv", ".html", ".xml", ".js", ".ts", ".sh", ".tex",
 }
-SUPPORTED_PDF = {".pdf"}
+SUPPORTED_PDF  = {".pdf"}
 SUPPORTED_DOCX = {".docx"}
 SUPPORTED = SUPPORTED_TEXT | SUPPORTED_PDF | SUPPORTED_DOCX
 
@@ -74,8 +58,6 @@ SUPPORTED = SUPPORTED_TEXT | SUPPORTED_PDF | SUPPORTED_DOCX
 # --------------------------------------------------------------------------
 
 def _get(obj, key, default=None):
-    """Read a field from an Ollama response (works whether it's a pydantic
-    model or a plain dict)."""
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
@@ -103,12 +85,8 @@ def read_text_file(path: Path) -> str:
 
 
 def read_pdf(path: Path) -> str:
-    try:
-        from pypdf import PdfReader
-    except ImportError:
-        raise ImportError("PDF support needs:  pip install pypdf")
-    reader = PdfReader(str(path))
-    return "\n".join((page.extract_text() or "") for page in reader.pages)
+    doc = fitz.open(path)
+    return "\n".join(page.get_text() for page in doc)
 
 
 def read_docx(path: Path) -> str:
@@ -252,55 +230,51 @@ class VectorStore:
 
 
 # --------------------------------------------------------------------------
-# Ollama interaction
+# vast.ai / OpenAI-compatible API interaction
 # --------------------------------------------------------------------------
 
-def make_client(args) -> Client:
-    return Client(host=args.host, timeout=600)
+def make_client(args) -> OpenAI:
+    api_key = os.getenv("VAST_API_KEY", "not-required")
+    return OpenAI(base_url=args.base_url, api_key=api_key, timeout=600)
 
 
-def ensure_models(client: Client, needed: list[str], host: str) -> None:
+def check_connection(client: OpenAI, base_url: str) -> None:
     try:
-        listing = client.list()
+        client.models.list()
     except Exception as e:
-        sys.exit(f"Cannot reach Ollama at {host}. Start it with 'ollama serve'.\n  ({e})")
-
-    models = _get(listing, "models", []) or []
-    present: set[str] = set()
-    for m in models:
-        name = _get(m, "model") or _get(m, "name")
-        if name:
-            present.add(name)
-            present.add(name.split(":")[0])
-
-    missing = [n for n in needed if n not in present and n.split(":")[0] not in present]
-    if missing:
-        print("Required Ollama models are not installed. Pull them first:")
-        for m in missing:
-            print(f"    ollama pull {m}")
-        sys.exit(1)
+        sys.exit(
+            f"Cannot reach API at {base_url}.\n"
+            f"Check VAST_BASE_URL and VAST_API_KEY in your .env file.\n  ({e})"
+        )
 
 
-def embed_texts(client: Client, model: str, texts: list[str],
-                keep_alive: str = "5m", batch: int = 32) -> np.ndarray:
+def embed_texts(client: OpenAI, model: str, texts: list[str],
+                batch: int = 32) -> np.ndarray:
     vectors: list[list[float]] = []
     for i in range(0, len(texts), batch):
-        resp = client.embed(model=model, input=texts[i:i + batch],
-                            keep_alive=keep_alive)
-        embs = _get(resp, "embeddings")
-        if embs is None:
-            sys.exit("Embedding response had no 'embeddings' field; check the embed model.")
-        vectors.extend(embs)
+        resp = client.embeddings.create(model=model, input=texts[i:i + batch])
+        vectors.extend(item.embedding for item in resp.data)
     return normalize(np.array(vectors, dtype=np.float32))
 
 
-SYSTEM_PROMPT = (
-    "You are a precise offline assistant. Answer the user's question using ONLY "
-    "the provided context. If the answer is not contained in the context, say you "
-    "don't know rather than guessing. When you use a passage, cite its source "
-    "filename in square brackets, e.g. [notes.pdf]."
-)
+SYSTEM_PROMPT = """
+Ești un asistent RAG.
 
+Primești:
+1. Un context extras din documente.
+2. O întrebare.
+
+Trebuie să răspunzi doar pe baza contextului.
+
+Dacă răspunsul apare în context, citează și rezumă informația relevantă.
+
+Dacă informația nu apare în context, răspunde exact:
+"Nu am găsit această informație în documentele furnizate."
+
+Nu spune că informația lipsește dacă există în context.
+Nu face presupuneri.
+Nu adăuga cunoștințe proprii.
+"""
 
 def build_user_prompt(question: str, hits: list[tuple[dict, float]]) -> str:
     if not hits:
@@ -311,21 +285,35 @@ def build_user_prompt(question: str, hits: list[tuple[dict, float]]) -> str:
             src = os.path.basename(rec["source"])
             blocks.append(f"[{i}] source: {src}\n{rec['text']}")
         context = "\n\n".join(blocks)
-    return f"Context:\n{context}\n\nQuestion: {question}"
+    return f"""
+        Context:
+
+        {context}
+
+        Întrebare:
+        {question}
+
+        Răspuns:
+        """
 
 
-def answer(client, args, question, hits, history=None) -> str:
+def answer(client: OpenAI, args, question: str,
+           hits: list[tuple[dict, float]], history=None) -> str:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
         messages += history
     messages.append({"role": "user", "content": build_user_prompt(question, hits)})
 
-    options = {"temperature": args.temperature, "num_ctx": args.num_ctx}
     full = ""
-    for part in client.chat(model=args.llm_model, messages=messages,
-                            options=options, keep_alive=args.keep_alive,
-                            stream=True):
-        token = _get(_get(part, "message"), "content", "") or ""
+    stream = client.chat.completions.create(
+        model=args.llm_model,
+        messages=messages,
+        temperature=args.temperature,
+        max_tokens=args.num_ctx,
+        stream=True,
+    )
+    for chunk in stream:
+        token = chunk.choices[0].delta.content or ""
         full += token
         print(token, end="", flush=True)
     print()
@@ -342,10 +330,9 @@ def answer(client, args, question, hits, history=None) -> str:
 
 def cmd_ingest(args):
     client = make_client(args)
-    ensure_models(client, [args.embed_model], args.host)
+    check_connection(client, args.base_url)
 
     store = VectorStore(args.store, args.embed_model).load()
-    # keep one embedding space per store
     if store.records and store.embed_model != args.embed_model:
         sys.exit(f"Store was built with embed model '{store.embed_model}'. "
                  f"Use --embed-model {store.embed_model} or 'reset' first.")
@@ -362,7 +349,7 @@ def cmd_ingest(args):
         if key in store.files and store.files[key]["hash"] == h:
             print(f"  unchanged: {f}")
             continue
-        if key in store.files:                          # changed -> drop old chunks
+        if key in store.files:
             for rid in store.files[key]["ids"]:
                 store.records.pop(rid, None)
             print(f"  updating:  {f}")
@@ -384,7 +371,7 @@ def cmd_ingest(args):
             continue
 
         chunks = chunk_text(raw, args.chunk_size, args.chunk_overlap)
-        vecs = embed_texts(client, args.embed_model, chunks, args.keep_alive)
+        vecs = embed_texts(client, args.embed_model, chunks)
 
         ids = []
         for ci, (chunk, vec) in enumerate(zip(chunks, vecs)):
@@ -410,10 +397,10 @@ def cmd_query(args):
     embed_model = store.embed_model or args.embed_model
 
     client = make_client(args)
-    ensure_models(client, [embed_model, args.llm_model], args.host)
+    check_connection(client, args.base_url)
 
     store.build_index()
-    qvec = embed_texts(client, embed_model, [args.question], args.keep_alive)
+    qvec = embed_texts(client, embed_model, [args.question])
     hits = store.search(qvec, args.top_k)
     answer(client, args, args.question, hits)
 
@@ -426,10 +413,10 @@ def cmd_chat(args):
     embed_model = store.embed_model or args.embed_model
 
     client = make_client(args)
-    ensure_models(client, [embed_model, args.llm_model], args.host)
+    check_connection(client, args.base_url)
     store.build_index()
 
-    print("Offline RAG chat  (type 'exit' or Ctrl-D to quit)\n")
+    print("RAG chat  (type 'exit' or Ctrl-D to quit)\n")
     history: list[dict] = []
     while True:
         try:
@@ -442,8 +429,14 @@ def cmd_chat(args):
         if question.lower() in {"exit", "quit"}:
             break
 
-        qvec = embed_texts(client, embed_model, [question], args.keep_alive)
+        qvec = embed_texts(client, embed_model, [question])
         hits = store.search(qvec, args.top_k)
+
+        for i, (rec, score) in enumerate(hits):
+            print(f"\n=== HIT {i+1} ===")
+            print(f"score={score:.4f}")
+            print(rec["text"][:3000])
+            print()
         print("rag> ", end="", flush=True)
         reply = answer(client, args, question, hits, history)
 
@@ -477,24 +470,24 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--store", default=DEFAULTS["store"],
                         help="directory holding the index (default: %(default)s)")
-    common.add_argument("--host", default=DEFAULTS["host"],
-                        help="Ollama server URL (default: %(default)s)")
+    common.add_argument("--base-url", default=DEFAULTS["base_url"],
+                        help="OpenAI-compatible API base URL, e.g. "
+                             "http://your-instance.vast.ai:port/v1 "
+                             "(default: %(default)s, override with VAST_BASE_URL in .env)")
     common.add_argument("--llm-model", default=DEFAULTS["llm_model"],
-                        help="generation model (default: %(default)s)")
+                        help="generation model name on the remote server (default: %(default)s)")
     common.add_argument("--embed-model", default=DEFAULTS["embed_model"],
-                        help="embedding model (default: %(default)s)")
+                        help="embedding model name on the remote server (default: %(default)s)")
     common.add_argument("--top-k", type=int, default=DEFAULTS["top_k"],
                         help="chunks to retrieve (default: %(default)s)")
     common.add_argument("--chunk-size", type=int, default=DEFAULTS["chunk_size"])
     common.add_argument("--chunk-overlap", type=int, default=DEFAULTS["chunk_overlap"])
-    common.add_argument("--num-ctx", type=int, default=DEFAULTS["num_ctx"])
+    common.add_argument("--num-ctx", type=int, default=DEFAULTS["num_ctx"],
+                        help="max tokens in the LLM response (default: %(default)s)")
     common.add_argument("--temperature", type=float, default=DEFAULTS["temperature"])
-    common.add_argument("--keep-alive", default=DEFAULTS["keep_alive"],
-                        help="how long Ollama holds the model after a call; "
-                             "'0' frees RAM immediately (default: %(default)s)")
 
     parser = argparse.ArgumentParser(
-        description="Offline RAG (Gemma 3 4B via Ollama) for Ryzen 7 + Radeon 780M.")
+        description="RAG powered by a remote LLM on vast.ai (OpenAI-compatible API).")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("ingest", parents=[common], help="vectorize files/folders")
@@ -505,15 +498,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("question")
     p.set_defaults(func=cmd_query)
 
-    sub.add_parser("chat", parents=[common], help="interactive session").set_defaults(func=cmd_chat)
+    sub.add_parser("chat",  parents=[common], help="interactive session").set_defaults(func=cmd_chat)
     sub.add_parser("stats", parents=[common], help="show what's indexed").set_defaults(func=cmd_stats)
     sub.add_parser("reset", parents=[common], help="wipe the index").set_defaults(func=cmd_reset)
     return parser
 
 
 def main():
-    # Windows consoles default to a legacy codepage; force UTF-8 so streamed
-    # model tokens (em-dashes, accents, etc.) don't raise UnicodeEncodeError.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8")
